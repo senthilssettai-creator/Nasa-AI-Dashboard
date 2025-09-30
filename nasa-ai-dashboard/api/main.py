@@ -1,0 +1,166 @@
+# main.py
+import os, json, sys
+from typing import List, Optional
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from pydantic import BaseModel
+from dotenv import load_dotenv
+import psycopg2
+import requests
+
+load_dotenv(".env")
+
+POSTGRES_URL = os.getenv("POSTGRES_URL", "postgresql://app:changeme@db:5432/spacebio")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+NASA_API_KEY = os.getenv("NASA_API_KEY")
+
+def get_conn():
+    return psycopg2.connect(POSTGRES_URL)
+
+# create schema on startup
+def ensure_schema():
+    conn = get_conn()
+    cur = conn.cursor()
+    with open("schema.sql","r") as f:
+        cur.execute(f.read())
+    conn.commit()
+    cur.close()
+    conn.close()
+
+app = FastAPI(title="SpaceBio Dashboard API")
+
+@app.on_event("startup")
+def startup():
+    try:
+        ensure_schema()
+        print("DB schema ensured.")
+    except Exception as e:
+        print("Schema ensure error:", e, file=sys.stderr)
+
+class ComponentsRequest(BaseModel):
+    q: Optional[str] = None
+    page: int = 1
+    page_size: int = 20
+
+class ChatRequest(BaseModel):
+    query: str
+    context_item_ids: Optional[List[str]] = []
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.post("/components")
+def components(req: ComponentsRequest):
+    q = req.q or ""
+    page = max(1, req.page)
+    page_size = min(200, max(1, req.page_size))
+    conn = get_conn()
+    cur = conn.cursor()
+    if q:
+        cur.execute("SELECT id, title, ai_summary_short, thumbnail, source FROM items WHERE title ILIKE %s OR abstract ILIKE %s ORDER BY created_at DESC LIMIT %s OFFSET %s",
+                    (f"%{q}%", f"%{q}%", page_size, (page-1)*page_size))
+    else:
+        cur.execute("SELECT id, title, ai_summary_short, thumbnail, source FROM items ORDER BY created_at DESC LIMIT %s OFFSET %s",
+                    (page_size, (page-1)*page_size))
+    rows = cur.fetchall()
+    items = []
+    for r in rows:
+        items.append({"id": str(r[0]), "title": r[1], "summary": r[2], "thumbnail": r[3], "source": r[4]})
+    cur.close()
+    conn.close()
+    return {"items": items, "page": page}
+
+@app.get("/item/{item_id}")
+def get_item(item_id: str, background_tasks: BackgroundTasks):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id, source, source_id, title, abstract, file_links, ai_summary_short, ai_summary_long, extracted_entities, thumbnail FROM items WHERE id=%s", (item_id,))
+    row = cur.fetchone()
+    if not row:
+        cur.close(); conn.close()
+        raise HTTPException(status_code=404, detail="Item not found")
+    item = {
+        "id": str(row[0]),
+        "source": row[1],
+        "source_id": row[2],
+        "title": row[3],
+        "abstract": row[4],
+        "file_links": row[5],
+        "ai_summary_short": row[6],
+        "ai_summary_long": row[7],
+        "extracted_entities": row[8],
+        "thumbnail": row[9]
+    }
+    cur.close()
+    conn.close()
+    # If no summary or thumbnail, generate in background
+    if (not item["ai_summary_long"]) or (not item["thumbnail"]):
+        background_tasks.add_task(generate_item_details, item_id)
+    return item
+
+def generate_item_details(item_id: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT title, abstract FROM items WHERE id=%s", (item_id,))
+    row = cur.fetchone()
+    if not row:
+        cur.close(); conn.close()
+        return
+    title, abstract = row
+    text = (title or "") + "\n\n" + (abstract or "")
+    # Generate summary (stub if no key)
+    summary = {"short": (text[:200] + ("..." if len(text)>200 else "")), "long": text}
+    entities = {}
+    # attempt NASA image search for thumbnail
+    thumbnail = None
+    if NASA_API_KEY:
+        try:
+            r = requests.get("https://images-api.nasa.gov/search", params={"q": title or "space", "media_type": "image"}, timeout=10)
+            j = r.json()
+            items = j.get("collection", {}).get("items", [])
+            if items:
+                links = items[0].get("links", [])
+                if links:
+                    thumbnail = links[0].get("href")
+        except Exception:
+            thumbnail = None
+    # TODO: replace with real Gemini calls to populate summary & entities
+    try:
+        cur.execute("""
+          UPDATE items SET ai_summary_short=%s, ai_summary_long=%s, extracted_entities=%s, thumbnail=%s, updated_at=now()
+          WHERE id=%s
+        """, (summary["short"], summary["long"], json.dumps(entities), thumbnail, item_id))
+        conn.commit()
+    except Exception as e:
+        print("DB update error:", e, file=sys.stderr)
+    cur.close()
+    conn.close()
+
+@app.post("/search")
+def search(req: ComponentsRequest):
+    return components(req)
+
+@app.post("/chat")
+def chat(req: ChatRequest):
+    # Retrieve context items
+    conn = get_conn()
+    cur = conn.cursor()
+    evidence_texts = []
+    for iid in (req.context_item_ids or [])[:10]:
+        cur.execute("SELECT title, abstract, ai_summary_long FROM items WHERE id=%s", (iid,))
+        r = cur.fetchone()
+        if r:
+            evidence_texts.append({"id": iid, "title": r[0], "text": r[2] or r[1] or ""})
+    cur.close()
+    conn.close()
+    # Build prompt (simple)
+    prompt = "Answer using only the evidence below. If not supported, say 'I don't know'.\n\n"
+    for e in evidence_texts:
+        prompt += f"---\nSourceID: {e['id']}\nTitle: {e['title']}\nText: {e['text'][:2000]}\n\n"
+    prompt += f"User question: {req.query}\n"
+    # If GEMINI_API_KEY is not present, return the prompt for debugging
+    if not GEMINI_API_KEY:
+        return {"answer": "LLM not configured. Set GEMINI_API_KEY in .env.", "prompt": prompt}
+    # Here you would call the Gemini API; left as an exercise to add real call.
+    return {"answer": "LLM call placeholder — implement Gemini API call in main.py", "prompt": prompt}
+
