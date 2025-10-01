@@ -1,0 +1,7 @@
+project_id = "fharmcjqguiiboqgateb"
+
+[functions.fetch-astronomical-objects]
+verify_jwt = false
+
+[functions.ai-astronomy-chat]
+verify_jwt = false
